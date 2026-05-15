@@ -206,68 +206,24 @@ impl DocPostingBlock {
     }
 }
 
-/// Positions posting block: parallel to `DocPostingBlock`, storing per-document
-/// position lists. The block key uses the same `first_docid` anchor as the
-/// corresponding doc posting block; callers derive which block to read from the
-/// doc posting list.
-#[derive(Debug, Clone, Default)]
-struct PosPostingBlock {
-    /// `positions[i]` is the sorted position list for the i-th document in the
-    /// paired `DocPostingBlock`.
-    positions: Vec<Vec<u32>>,
+/// Encode a single document's sorted position list as delta-compressed LEB128.
+fn encode_positions(positions: &[u32]) -> Vec<u8> {
+    let mut value = vec![];
+    let mut prev = 0u32;
+    for &pos in positions {
+        leb128::write::unsigned(&mut value, (pos - prev) as u64).unwrap();
+        prev = pos;
+    }
+    value
 }
 
-impl PosPostingBlock {
-    /// Insert a position list at `rank` for a new document. `rank` is the
-    /// index returned by `DocPostingBlock::insert` when inserting the same
-    /// document.
-    pub fn insert(&mut self, rank: usize, positions: Vec<u32>) {
-        self.positions.insert(rank, positions);
-    }
-
-    /// Moves the upper half of entries into a new block, mirroring
-    /// `DocPostingBlock::split`.
-    pub fn split(&mut self) -> PosPostingBlock {
-        let half = self.positions.len() / 2;
-        PosPostingBlock {
-            positions: self.positions.drain(half..).collect(),
-        }
-    }
-
-    /// Decode a block from its value, using `freqs` to determine how many
-    /// positions belong to each document (via term frequency).
-    pub fn decode(
-        value: impl AsRef<[u8]>,
-        freqs: impl ExactSizeIterator<Item = u32>,
-    ) -> Option<Self> {
-        let mut cursor = io::Cursor::new(value.as_ref());
-        let mut positions = Vec::with_capacity(freqs.len());
-        for tf in freqs {
-            let mut doc_positions = Vec::with_capacity(tf as usize);
-            let mut prev = 0u32;
-            for _ in 0..tf {
-                let delta = leb128::read::unsigned(&mut cursor).ok()?;
-                prev += delta as u32;
-                doc_positions.push(prev);
-            }
-            positions.push(doc_positions);
-        }
-        Some(Self { positions })
-    }
-
-    /// Encode the block. Position counts are not stored; they are recovered from the paired
-    /// `DocPostingBlock` on decode.
-    pub fn encode(&self) -> Vec<u8> {
-        assert!(!self.positions.is_empty());
-        let mut value = vec![];
-        for doc_positions in &self.positions {
-            let mut prev = 0u32;
-            for &pos in doc_positions {
-                leb128::write::unsigned(&mut value, (pos - prev) as u64).unwrap();
-                prev = pos;
-            }
-        }
-        value
+/// Decode a single document's position list produced by `encode_positions` into `out`.
+fn decode_positions(value: impl AsRef<[u8]>, out: &mut Vec<PosId>) {
+    let mut cursor = io::Cursor::new(value.as_ref());
+    let mut prev = 0u32;
+    while let Ok(delta) = leb128::read::unsigned(&mut cursor) {
+        prev += delta as u32;
+        out.push(prev);
     }
 }
 
@@ -347,6 +303,17 @@ impl TokenFieldIndex {
         key
     }
 
+    fn pospl_key(&self, docid: DocId, token: impl AsRef<[u8]>) -> Vec<u8> {
+        let token_ref = token.as_ref();
+        let mut key = Vec::with_capacity(8 + 1 + self.name.len() + 1 + token_ref.len());
+        key.extend_from_slice(&docid.to_be_bytes());
+        key.push(b':');
+        key.extend_from_slice(self.name.as_bytes());
+        key.push(b':');
+        key.extend_from_slice(token_ref);
+        key
+    }
+
     fn pl_key_extract_docid(key: impl AsRef<[u8]>) -> Option<DocId> {
         let key_ref = key.as_ref();
         // Field name and token text must be at least, plus separators and the docid: 2+2+8=12
@@ -402,10 +369,7 @@ pub fn write_tokens<T: AsRef<[u8]> + Eq + Hash>(
         let new_stats = match stats {
             None => {
                 if let Some(pospl_keyspace) = field.pospl_keyspace.as_ref() {
-                    let key = field.pl_key(&token, docid);
-                    let mut pos_block = PosPostingBlock::default();
-                    pos_block.insert(0, positions);
-                    tx.insert(pospl_keyspace, &key, pos_block.encode());
+                    tx.insert(pospl_keyspace, field.pospl_key(docid, &token), encode_positions(&positions));
                 }
                 TokenStats::SingleHit {
                     docid,
@@ -471,28 +435,7 @@ fn write_posting_entry(
     let mut doc_pl_block =
         DocPostingBlock::decode(&pl_key, doc_pl_value, field.features).expect("doc pl decode");
 
-    let mut pos_pl_state = field
-        .pospl_keyspace
-        .as_ref()
-        .map(|keyspace| {
-            let pos_pl_value = tx.get(keyspace, &pl_key)?.expect("parallel pos pl block");
-            Ok::<_, fjall::Error>((
-                keyspace,
-                PosPostingBlock::decode(
-                    pos_pl_value,
-                    doc_pl_block.term_frequencies.iter().copied(),
-                )
-                .expect("pos pl decode"),
-            ))
-        })
-        .transpose()?;
-
-    // Insert into both blocks at the same rank. Note that we are writing term frequency regardless
-    // of settings, the data will be dropped at encoding time if it is not used.
-    let insert_rank = doc_pl_block.insert(docid, positions.len() as u32);
-    if let Some((_, pos_block)) = pos_pl_state.as_mut() {
-        pos_block.insert(insert_rank, positions);
-    }
+    doc_pl_block.insert(docid, positions.len() as u32);
 
     if doc_pl_block.len() > MAX_PL_BLOCK_SIZE {
         let doc_block_tail = doc_pl_block.split();
@@ -503,10 +446,6 @@ fn write_posting_entry(
             &key,
             doc_block_tail.encode(field.features),
         );
-        if let Some((keyspace, pos_block)) = pos_pl_state.as_mut() {
-            let pos_block_tail = pos_block.split();
-            tx.insert(keyspace, &key, pos_block_tail.encode());
-        }
     }
 
     let old_pl_key_docid = doc_pl_block
@@ -516,20 +455,23 @@ fn write_posting_entry(
     let new_pl_key_docid = doc_pl_block.doc_iter().next().unwrap();
     if old_pl_key_docid != new_pl_key_docid {
         tx.remove(&field.docpl_keyspace, pl_key.clone());
-        if let Some((keyspace, _)) = pos_pl_state.as_ref() {
-            tx.remove(keyspace, pl_key);
-        }
         pl_key = Slice::from(field.pl_key(token, new_pl_key_docid));
     }
 
     tx.insert(
         &field.docpl_keyspace,
-        pl_key.clone(),
+        pl_key,
         doc_pl_block.encode(field.features),
     );
-    if let Some((keyspace, pos_block)) = pos_pl_state {
-        tx.insert(keyspace, pl_key, pos_block.encode());
+
+    if let Some(pospl_keyspace) = field.pospl_keyspace.as_ref() {
+        tx.insert(
+            pospl_keyspace,
+            field.pospl_key(docid, token),
+            encode_positions(&positions),
+        );
     }
+
     Ok(())
 }
 
@@ -593,9 +535,8 @@ struct DocBlockState {
 
 struct PosState {
     keyspace: SingleWriterTxKeyspace,
-    /// Current position block, loaded in parallel with `doc_block`. `None` for
-    /// single-doc terms (their pos block is fetched lazily on demand).
-    block: Option<PosPostingBlock>,
+    /// Full pospl key with a placeholder docid in the first 8 bytes, updated before each lookup.
+    key: Vec<u8>,
 }
 
 // TODO: generics -- Readable instead of Snapshot; AsRef<Keyspace> instead of SingleWriterTxKeyspace.
@@ -641,7 +582,7 @@ impl TokenPostingIterator {
             };
         let pos_state = field.pospl_keyspace.as_ref().map(|ks| PosState {
             keyspace: ks.clone(),
-            block: None,
+            key: field.pospl_key(0, &token),
         });
         Ok(Some(TokenPostingIterator {
             features: field.features,
@@ -746,10 +687,6 @@ impl TokenPostingIterator {
     }
 
     fn update_doc_block(&mut self, block_entry: fjall::Result<Option<(Slice, Slice)>>) -> DocId {
-        // Invalidate cached pos block whenever the doc block changes.
-        if let Some(ps) = self.pos_state.as_mut() {
-            ps.block = None;
-        }
         if let Some((key, value)) = block_entry.expect("no read error") {
             let block =
                 DocPostingBlock::decode(&key, &value, self.features).expect("doc pl decode");
@@ -859,44 +796,14 @@ impl PostingIterator for TokenPostingIterator {
         }
 
         assert!(self.doc_state.is_some());
-        if self.pos_state.as_ref().unwrap().block.is_none() {
-            let block_docid = self
-                .doc_state
-                .as_ref()
-                .unwrap()
-                .block
-                .first_docid()
-                .unwrap();
-            self.update_scratch_key(block_docid);
-            let value = self
-                .snapshot
-                .get(
-                    &self.pos_state.as_ref().unwrap().keyspace,
-                    &self.scratch_key,
-                )
-                .expect("no io error")
-                .expect("parallel pos block exists");
-            let pos_block = if let Some((_, tf)) = self.single_doc {
-                PosPostingBlock::decode(value, [tf as u32].into_iter())
-            } else {
-                PosPostingBlock::decode(
-                    value,
-                    self.doc_state
-                        .as_ref()
-                        .unwrap()
-                        .block
-                        .term_frequencies
-                        .iter()
-                        .copied(),
-                )
-            }
-            .expect("decode pos block");
-            self.pos_state.as_mut().unwrap().block = Some(pos_block);
-        }
-
-        let doc_state = self.doc_state.as_ref().unwrap();
-        let pos_block = self.pos_state.as_ref().unwrap().block.as_ref().unwrap();
-        out.extend_from_slice(&pos_block.positions[doc_state.index]);
+        let pos_state = self.pos_state.as_mut().unwrap();
+        pos_state.key[..8].copy_from_slice(&self.doc.to_be_bytes());
+        let value = self
+            .snapshot
+            .get(&pos_state.keyspace, &pos_state.key)
+            .expect("no io error")
+            .expect("pos entry exists");
+        decode_positions(value, out);
     }
 }
 
