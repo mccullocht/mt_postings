@@ -305,14 +305,14 @@ impl TokenFieldIndex {
         features: TokenFieldFeatures,
         keyspace_create_options: Option<KeyspaceCreateOptions>,
     ) -> fjall::Result<Self> {
-        let stats_keyspace = db.keyspace(&format!("{index}.stats"), || {
+        let stats_keyspace = db.keyspace(&format!("{index}.{name}.stats"), || {
             keyspace_create_options.clone().unwrap_or_default()
         })?;
-        let docpl_keyspace = db.keyspace(&format!("{index}.docpl"), || {
+        let docpl_keyspace = db.keyspace(&format!("{index}.{name}.docpl"), || {
             keyspace_create_options.clone().unwrap_or_default()
         })?;
         let pospl_keyspace = if features == TokenFieldFeatures::WithPositions {
-            Some(db.keyspace(&format!("{index}.pospl"), || {
+            Some(db.keyspace(&format!("{index}.{name}.pospl"), || {
                 keyspace_create_options.clone().unwrap_or_default()
             })?)
         } else {
