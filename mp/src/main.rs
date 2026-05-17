@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use fjall::{KeyspaceCreateOptions, SingleWriterTxDatabase};
 use indicatif::{ProgressBar, ProgressStyle};
-use mt_postings::{TokenFieldFeatures, TokenFieldIndex, write_tokens};
+use mt_postings::{TokenFieldFeatures, TokenFieldIndex, TokenIndexBuffer};
 use reader::BinDocReader;
 use tantivy::tokenizer::{SimpleTokenizer, TokenStream, Tokenizer};
 
@@ -30,6 +30,15 @@ enum Command {
         bin_file: PathBuf,
         #[arg(long)]
         limit: Option<usize>,
+        /// Number of documents to buffer before flushing and committing.
+        #[arg(long, default_value_t = 1)]
+        batch_size: usize,
+        /// Maximum journal size in megabytes before a flush is triggered.
+        #[arg(long, default_value_t = 64)]
+        journaling_size_mb: u64,
+        /// Maximum memtable size in megabytes per keyspace before a flush is triggered.
+        #[arg(long, default_value_t = 8)]
+        memtable_size_mb: u64,
     },
     /// Drop all keyspaces for the ingested fields.
     Drop,
@@ -64,13 +73,21 @@ fn tokenize(text: &str) -> Vec<(u32, String)> {
     tokens
 }
 
-fn ingest(db: &PathBuf, bin_file: &PathBuf, limit: Option<usize>) {
+fn ingest(
+    db: &PathBuf,
+    bin_file: &PathBuf,
+    limit: Option<usize>,
+    batch_size: usize,
+    journaling_size_mb: u64,
+    memtable_size_mb: u64,
+) {
     let database = SingleWriterTxDatabase::builder(db)
-        .max_journaling_size(64 * 1_024 * 1_024)
+        .max_journaling_size(journaling_size_mb * 1_024 * 1_024)
         .open()
         .expect("failed to open fjall database");
 
-    let ks_opts = KeyspaceCreateOptions::default().max_memtable_size(8 * 1_024 * 1_024);
+    let ks_opts =
+        KeyspaceCreateOptions::default().max_memtable_size(memtable_size_mb * 1_024 * 1_024);
     let title_field = TokenFieldIndex::new(
         &database,
         "enwiki",
@@ -117,38 +134,65 @@ fn ingest(db: &PathBuf, bin_file: &PathBuf, limit: Option<usize>) {
         }
     };
 
-    let reader = BinDocReader::open(bin_file).expect("failed to open bin file");
-    for (docid, record) in reader.take(limit.unwrap_or(usize::MAX)).enumerate() {
-        let record = record.expect("failed to read record");
+    let mut next_docid: u64 = 0;
+    let mut title_buf: TokenIndexBuffer<String> =
+        TokenIndexBuffer::new(TokenFieldFeatures::WithPositions);
+    let mut body_buf: TokenIndexBuffer<String> =
+        TokenIndexBuffer::new(TokenFieldFeatures::WithPositions);
+    let mut random_label_buf: TokenIndexBuffer<String> =
+        TokenIndexBuffer::new(TokenFieldFeatures::WithPositions);
+    let mut batch_count = 0usize;
+
+    let flush = |title_buf: TokenIndexBuffer<String>,
+                 body_buf: TokenIndexBuffer<String>,
+                 random_label_buf: TokenIndexBuffer<String>,
+                 start_docid: u64|
+     -> u64 {
         let mut tx = database.write_tx();
-        write_tokens(
-            docid as u64,
-            &title_field,
-            tokenize(&record.title).into_iter(),
-            &mut tx,
-        )
-        .expect("failed to write title tokens");
-        write_tokens(
-            docid as u64,
-            &body_field,
-            tokenize(&record.body).into_iter(),
-            &mut tx,
-        )
-        .expect("failed to write body tokens");
-        write_tokens(
-            docid as u64,
-            &random_label_field,
-            tokenize(&record.random_label).into_iter(),
-            &mut tx,
-        )
-        .expect("failed to write random_label tokens");
+        let next = title_buf
+            .apply_append(&title_field, start_docid, &mut tx)
+            .expect("failed to apply title buffer");
+        body_buf
+            .apply_append(&body_field, start_docid, &mut tx)
+            .expect("failed to apply body buffer");
+        random_label_buf
+            .apply_append(&random_label_field, start_docid, &mut tx)
+            .expect("failed to apply random_label buffer");
         tx.commit().expect("failed to commit transaction");
+        next
+    };
+
+    let mut total_bytes = 0u64;
+    let reader = BinDocReader::open(bin_file).expect("failed to open bin file");
+    for record in reader.take(limit.unwrap_or(usize::MAX)) {
+        let record = record.expect("failed to read record");
+        total_bytes += (record.title.len() + record.body.len() + record.random_label.len()) as u64;
+        title_buf.add_doc(tokenize(&record.title).into_iter());
+        body_buf.add_doc(tokenize(&record.body).into_iter());
+        random_label_buf.add_doc(tokenize(&record.random_label).into_iter());
+        batch_count += 1;
         pb.inc(1);
+
+        if batch_count >= batch_size {
+            next_docid = flush(title_buf, body_buf, random_label_buf, next_docid);
+            title_buf = TokenIndexBuffer::new(TokenFieldFeatures::WithPositions);
+            body_buf = TokenIndexBuffer::new(TokenFieldFeatures::WithPositions);
+            random_label_buf = TokenIndexBuffer::new(TokenFieldFeatures::WithPositions);
+            batch_count = 0;
+        }
     }
+
+    if batch_count > 0 {
+        flush(title_buf, body_buf, random_label_buf, next_docid);
+    }
+
     database
         .persist(fjall::PersistMode::SyncAll)
         .expect("persist");
-    pb.finish_with_message("done");
+    let elapsed_secs = pb.elapsed().as_secs_f64();
+    let gb_per_hour = (total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)) / (elapsed_secs / 3600.0);
+    pb.finish();
+    println!("{gb_per_hour:.2} GB/hour");
 }
 
 fn stat(db: &PathBuf) {
@@ -233,7 +277,20 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Ingest { bin_file, limit } => ingest(&cli.db, &bin_file, limit),
+        Command::Ingest {
+            bin_file,
+            limit,
+            batch_size,
+            journaling_size_mb,
+            memtable_size_mb,
+        } => ingest(
+            &cli.db,
+            &bin_file,
+            limit,
+            batch_size,
+            journaling_size_mb,
+            memtable_size_mb,
+        ),
         Command::Stat => stat(&cli.db),
         Command::Compact => compact(&cli.db),
         Command::Drop => drop(&cli.db),

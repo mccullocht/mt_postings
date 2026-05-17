@@ -74,13 +74,17 @@ impl TokenStats {
         stats
     }
 
-    /// Return a the table key for `term` in `field`.
-    pub fn key(field: &str, term: impl AsRef<[u8]>) -> Vec<u8> {
-        let mut key = Vec::with_capacity(field.len() + "::stats".len() + term.as_ref().len());
-        key.extend_from_slice(field.as_bytes());
-        key.extend_from_slice(b":stats:");
-        key.extend_from_slice(term.as_ref());
-        key
+    fn frequencies(&self) -> (u64, u64) {
+        match self {
+            Self::SingleHit {
+                docid: _,
+                term_frequency,
+            } => (1, *term_frequency),
+            Self::MultiHit {
+                doc_frequency,
+                term_frequency,
+            } => (*doc_frequency, *term_frequency),
+        }
     }
 }
 
@@ -336,6 +340,251 @@ impl TokenFieldIndex {
 /// Maximum number of values in a single doc block.
 const MAX_PL_BLOCK_SIZE: usize = 256;
 
+enum TokenIndexBufferRep<T> {
+    Doc(HashMap<T, Vec<u32>>),
+    WithTermFrequency(HashMap<T, Vec<(u32, u32)>>),
+    WithPositions(HashMap<T, Vec<(u32, Vec<u32>)>>),
+}
+
+/// Buffer for TokenFieldIndex mutations that can span multiple documents.
+/// These changes can be applied to an index as a block of documents, amortizing costs related to
+/// patching posting data across many docs.
+///
+/// This is likely to be helpful in the average case but may not help in cases where documents have
+/// no overlap in their token data. This is unlikely for natural language input.
+pub struct TokenIndexBuffer<T> {
+    rep: TokenIndexBufferRep<T>,
+    next_docid: u32,
+}
+
+impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
+    /// Create a new buffer.
+    ///
+    /// `features` is used to minimize the size of the representation.
+    // XXX maybe fields should generate these objects?
+    pub fn new(features: TokenFieldFeatures) -> Self {
+        let rep = match features {
+            TokenFieldFeatures::Doc => TokenIndexBufferRep::Doc(HashMap::new()),
+            TokenFieldFeatures::WithTermFrequency => {
+                TokenIndexBufferRep::WithTermFrequency(HashMap::new())
+            }
+            TokenFieldFeatures::WithPositions => TokenIndexBufferRep::WithPositions(HashMap::new()),
+        };
+        Self { rep, next_docid: 0 }
+    }
+
+    /// Add a doc as a stream of (pos, token).
+    pub fn add_doc(&mut self, tokens: impl IntoIterator<Item = (u32, T)>) {
+        let docid = self.next_docid;
+        self.next_docid += 1;
+
+        match &mut self.rep {
+            TokenIndexBufferRep::Doc(m) => {
+                for (_, token) in tokens {
+                    // Flatten repeated occurrences.
+                    let pl = m.entry(token).or_default();
+                    if pl.last().is_none_or(|d| *d != docid) {
+                        pl.push(docid);
+                    }
+                }
+            }
+            TokenIndexBufferRep::WithTermFrequency(m) => {
+                for (_, token) in tokens {
+                    // Increment on repeated occurrences.
+                    let pl = m.entry(token).or_default();
+                    if let Some((d, tf)) = pl.last_mut()
+                        && *d == docid
+                    {
+                        *tf += 1;
+                    } else {
+                        pl.push((docid, 1))
+                    }
+                }
+            }
+            TokenIndexBufferRep::WithPositions(m) => {
+                for (pos, token) in tokens {
+                    let pl = m.entry(token).or_default();
+                    if let Some((d, pos_pl)) = pl.last_mut()
+                        && *d == docid
+                    {
+                        pos_pl.push(pos);
+                    } else {
+                        pl.push((docid, vec![pos]))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply this batch as an append to `field` starting at `start_docid` to `tx`.
+    ///
+    /// Returns the next free docid.
+    ///
+    /// _This method assumes that start_docid and all docids after are unused._
+    pub fn apply_append(
+        self,
+        field: &TokenFieldIndex,
+        start_docid: DocId,
+        tx: &mut SingleWriterWriteTx<'_>,
+    ) -> fjall::Result<DocId> {
+        match self.rep {
+            TokenIndexBufferRep::Doc(m) => {
+                for (token, pl) in m {
+                    let doc_block = Self::update_stats_and_generate_doc_pl(
+                        field,
+                        token.as_ref(),
+                        start_docid,
+                        pl.iter().map(|&d| (d, 1)),
+                        tx,
+                    )?;
+                    Self::update_doc_pl(field, token.as_ref(), doc_block, tx)?;
+                }
+            }
+            TokenIndexBufferRep::WithTermFrequency(m) => {
+                for (token, pl) in m {
+                    let doc_block = Self::update_stats_and_generate_doc_pl(
+                        field,
+                        token.as_ref(),
+                        start_docid,
+                        pl.iter().copied(),
+                        tx,
+                    )?;
+                    Self::update_doc_pl(field, token.as_ref(), doc_block, tx)?;
+                }
+            }
+            TokenIndexBufferRep::WithPositions(m) => {
+                for (token, pl) in m {
+                    let doc_block = Self::update_stats_and_generate_doc_pl(
+                        field,
+                        token.as_ref(),
+                        start_docid,
+                        pl.iter().map(|(doc, pospl)| (*doc, pospl.len() as u32)),
+                        tx,
+                    )?;
+                    Self::update_doc_pl(field, token.as_ref(), doc_block, tx)?;
+                    for (doc, positions) in pl {
+                        let key = field.pospl_key(start_docid + doc as u64, token.as_ref());
+                        tx.insert(
+                            field.pospl_keyspace.as_ref().unwrap(),
+                            key,
+                            encode_positions(&positions),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(start_docid + self.next_docid as DocId)
+    }
+
+    fn update_stats_and_generate_doc_pl(
+        field: &TokenFieldIndex,
+        token: &[u8],
+        start_docid: DocId,
+        mut postings: impl ExactSizeIterator<Item = (u32, u32)>,
+        tx: &mut SingleWriterWriteTx<'_>,
+    ) -> fjall::Result<DocPostingBlock> {
+        let mut block = DocPostingBlock::default();
+
+        let stats_key = field.stats_key(token);
+        let old_stats = tx
+            .get(&field.stats_keyspace, &stats_key)?
+            .and_then(TokenStats::decode);
+        if let Some(TokenStats::SingleHit {
+            docid,
+            term_frequency,
+        }) = old_stats.as_ref()
+        {
+            block.docids.push(*docid);
+            block.term_frequencies.push(*term_frequency as u32);
+        }
+
+        let (stats, block) = if postings.len() == 1 && old_stats.is_none() {
+            let (ld, tf) = postings.next().unwrap();
+            let docid = start_docid + ld as u64;
+            block.docids.push(docid);
+            block.term_frequencies.push(tf);
+            (
+                TokenStats::SingleHit {
+                    docid,
+                    term_frequency: tf as u64,
+                },
+                block,
+            )
+        } else {
+            let (mut total_df, mut total_tf) = old_stats.map(|s| s.frequencies()).unwrap_or((0, 0));
+            total_df += postings.len() as u64;
+            for (ld, tf) in postings {
+                block.docids.push(start_docid + ld as u64);
+                block.term_frequencies.push(tf);
+                total_tf += tf as u64;
+            }
+            (
+                TokenStats::MultiHit {
+                    doc_frequency: total_df,
+                    term_frequency: total_tf,
+                },
+                block,
+            )
+        };
+
+        tx.insert(&field.stats_keyspace, &stats_key, stats.encode().as_ref());
+
+        Ok(block)
+    }
+
+    fn update_doc_pl(
+        field: &TokenFieldIndex,
+        token: &[u8],
+        block: DocPostingBlock,
+        tx: &mut SingleWriterWriteTx<'_>,
+    ) -> fjall::Result<()> {
+        let mut block_it = block.docids.iter().zip(block.term_frequencies.iter());
+        let start_pl_key = field.pl_key(token, 0);
+        let end_pl_key = field.pl_key(token, block.first_docid().unwrap());
+        if let Some(g) = tx
+            .range(
+                &field.docpl_keyspace,
+                start_pl_key.as_slice()..=end_pl_key.as_slice(),
+            )
+            .next_back()
+        {
+            let (key, value) = g.into_inner().expect("no read error");
+            let mut last_block =
+                DocPostingBlock::decode(&key, &value, field.features).expect("doc decode");
+            while last_block.len() < MAX_PL_BLOCK_SIZE {
+                if let Some((doc, tf)) = block_it.next() {
+                    last_block.docids.push(*doc);
+                    last_block.term_frequencies.push(*tf);
+                } else {
+                    break;
+                }
+            }
+            tx.insert(
+                &field.docpl_keyspace,
+                key,
+                last_block.encode(field.features),
+            );
+        }
+
+        while block_it.len() > 0 {
+            let mut doc_block = DocPostingBlock::default();
+            while doc_block.len() < MAX_PL_BLOCK_SIZE {
+                if let Some((doc, tf)) = block_it.next() {
+                    doc_block.docids.push(*doc);
+                    doc_block.term_frequencies.push(*tf);
+                } else {
+                    break;
+                }
+            }
+
+            let key = field.pl_key(token, doc_block.first_docid().unwrap());
+            tx.insert(&field.docpl_keyspace, key, doc_block.encode(field.features));
+        }
+
+        Ok(())
+    }
+}
+
 /// Write a sequence of tokens into `field` at `docid`.
 ///
 /// `tokens` is a stream of (position, term) so that callers may place more than one index term at
@@ -369,7 +618,11 @@ pub fn write_tokens<T: AsRef<[u8]> + Eq + Hash>(
         let new_stats = match stats {
             None => {
                 if let Some(pospl_keyspace) = field.pospl_keyspace.as_ref() {
-                    tx.insert(pospl_keyspace, field.pospl_key(docid, &token), encode_positions(&positions));
+                    tx.insert(
+                        pospl_keyspace,
+                        field.pospl_key(docid, &token),
+                        encode_positions(&positions),
+                    );
                 }
                 TokenStats::SingleHit {
                     docid,
