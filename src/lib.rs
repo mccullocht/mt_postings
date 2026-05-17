@@ -403,7 +403,6 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
             }
             TokenIndexBufferRep::WithPositions(m) => {
                 for (pos, token) in tokens {
-                    // Append positions to the list.
                     let pl = m.entry(token).or_default();
                     if let Some((d, pos_pl)) = pl.last_mut()
                         && *d == docid
@@ -413,7 +412,6 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
                         pl.push((docid, vec![pos]))
                     }
                 }
-                todo!()
             }
         }
     }
@@ -568,7 +566,7 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
             );
         }
 
-        while !block_it.len() > 0 {
+        while block_it.len() > 0 {
             let mut doc_block = DocPostingBlock::default();
             while doc_block.len() < MAX_PL_BLOCK_SIZE {
                 if let Some((doc, tf)) = block_it.next() {
