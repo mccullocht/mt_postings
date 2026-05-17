@@ -73,6 +73,19 @@ impl TokenStats {
         stats.1 = stats.0.len() - rem;
         stats
     }
+
+    fn frequencies(&self) -> (u64, u64) {
+        match self {
+            Self::SingleHit {
+                docid: _,
+                term_frequency,
+            } => (1, *term_frequency),
+            Self::MultiHit {
+                doc_frequency,
+                term_frequency,
+            } => (*doc_frequency, *term_frequency),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, Default)]
@@ -418,75 +431,159 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
     ) -> fjall::Result<DocId> {
         match self.rep {
             TokenIndexBufferRep::Doc(m) => {
-                // XXX must update term stats. may get an additional docid to write.
-                todo!()
+                for (token, pl) in m {
+                    let doc_block = Self::update_stats_and_generate_doc_pl(
+                        field,
+                        token.as_ref(),
+                        start_docid,
+                        pl.iter().map(|&d| (d, 1)),
+                        tx,
+                    )?;
+                    Self::update_doc_pl(field, token.as_ref(), doc_block, tx)?;
+                }
             }
             TokenIndexBufferRep::WithTermFrequency(m) => {
-                todo!()
+                for (token, pl) in m {
+                    let doc_block = Self::update_stats_and_generate_doc_pl(
+                        field,
+                        token.as_ref(),
+                        start_docid,
+                        pl.iter().copied(),
+                        tx,
+                    )?;
+                    Self::update_doc_pl(field, token.as_ref(), doc_block, tx)?;
+                }
             }
             TokenIndexBufferRep::WithPositions(m) => {
-                todo!()
+                for (token, pl) in m {
+                    let doc_block = Self::update_stats_and_generate_doc_pl(
+                        field,
+                        token.as_ref(),
+                        start_docid,
+                        pl.iter().map(|(doc, pospl)| (*doc, pospl.len() as u32)),
+                        tx,
+                    )?;
+                    Self::update_doc_pl(field, token.as_ref(), doc_block, tx)?;
+                    for (doc, positions) in pl {
+                        let key = field.pospl_key(start_docid + doc as u64, token.as_ref());
+                        tx.insert(
+                            field.pospl_keyspace.as_ref().unwrap(),
+                            key,
+                            encode_positions(&positions),
+                        );
+                    }
+                }
             }
         }
         Ok(start_docid + self.next_docid as DocId)
     }
 
-    /// Update the token stats and return the old stats (or none if not present).
-    fn update_token_stats(
-        &self,
+    fn update_stats_and_generate_doc_pl(
         field: &TokenFieldIndex,
         token: &[u8],
-        update: impl ExactSizeIterator<Item = (DocId, u64)>,
+        start_docid: DocId,
+        mut postings: impl ExactSizeIterator<Item = (u32, u32)>,
         tx: &mut SingleWriterWriteTx<'_>,
-    ) -> fjall::Result<Option<TokenStats>> {
+    ) -> fjall::Result<DocPostingBlock> {
+        let mut block = DocPostingBlock::default();
+
         let stats_key = field.stats_key(token);
         let old_stats = tx
             .get(&field.stats_keyspace, &stats_key)?
             .and_then(TokenStats::decode);
+        if let Some(TokenStats::SingleHit {
+            docid,
+            term_frequency,
+        }) = old_stats.as_ref()
+        {
+            block.docids.push(*docid);
+            block.term_frequencies.push(*term_frequency as u32);
+        }
 
-        assert!(update.len() > 0);
-        let (df, tf, first_docid) =
-            update.fold((0u64, 0u64, DOC_ID_DONE), |mut acc, (docid, tf)| {
-                let first = if acc.2 == DOC_ID_DONE { docid } else { acc.2 };
-                (acc.0 + 1, acc.1 + tf, first)
-            });
-
-        let new_stats = match old_stats {
-            None => {
-                if df > 1 {
-                    TokenStats::MultiHit {
-                        doc_frequency: df,
-                        term_frequency: tf,
-                    }
-                } else {
-                    TokenStats::SingleHit {
-                        docid: first_docid,
-                        term_frequency: tf,
-                    }
-                }
+        let (stats, block) = if postings.len() == 1 && old_stats.is_none() {
+            let (ld, tf) = postings.next().unwrap();
+            let docid = start_docid + ld as u64;
+            block.docids.push(docid);
+            block.term_frequencies.push(tf);
+            (
+                TokenStats::SingleHit {
+                    docid,
+                    term_frequency: tf as u64,
+                },
+                block,
+            )
+        } else {
+            let (mut total_df, mut total_tf) = old_stats.map(|s| s.frequencies()).unwrap_or((0, 0));
+            total_df += postings.len() as u64;
+            for (ld, tf) in postings {
+                block.docids.push(start_docid + ld as u64);
+                block.term_frequencies.push(tf);
+                total_tf += tf as u64;
             }
-            Some(TokenStats::SingleHit {
-                docid: _,
-                term_frequency,
-            }) => TokenStats::MultiHit {
-                doc_frequency: 1 + df,
-                term_frequency: term_frequency + tf,
-            },
-            Some(TokenStats::MultiHit {
-                doc_frequency,
-                term_frequency,
-            }) => TokenStats::MultiHit {
-                doc_frequency: doc_frequency + df,
-                term_frequency: term_frequency + tf,
-            },
+            (
+                TokenStats::MultiHit {
+                    doc_frequency: total_df,
+                    term_frequency: total_tf,
+                },
+                block,
+            )
         };
 
-        tx.insert(
-            &field.stats_keyspace,
-            &stats_key,
-            new_stats.encode().as_ref(),
-        );
-        Ok(old_stats)
+        tx.insert(&field.stats_keyspace, &stats_key, stats.encode().as_ref());
+
+        Ok(block)
+    }
+
+    fn update_doc_pl(
+        field: &TokenFieldIndex,
+        token: &[u8],
+        block: DocPostingBlock,
+        tx: &mut SingleWriterWriteTx<'_>,
+    ) -> fjall::Result<()> {
+        let mut block_it = block.docids.iter().zip(block.term_frequencies.iter());
+        let start_pl_key = field.pl_key(token, 0);
+        let end_pl_key = field.pl_key(token, block.first_docid().unwrap());
+        if let Some(g) = tx
+            .range(
+                &field.docpl_keyspace,
+                start_pl_key.as_slice()..=end_pl_key.as_slice(),
+            )
+            .next_back()
+        {
+            let (key, value) = g.into_inner().expect("no read error");
+            let mut last_block =
+                DocPostingBlock::decode(&key, &value, field.features).expect("doc decode");
+            while last_block.len() < MAX_PL_BLOCK_SIZE {
+                if let Some((doc, tf)) = block_it.next() {
+                    last_block.docids.push(*doc);
+                    last_block.term_frequencies.push(*tf);
+                } else {
+                    break;
+                }
+            }
+            tx.insert(
+                &field.docpl_keyspace,
+                key,
+                last_block.encode(field.features),
+            );
+        }
+
+        while !block_it.len() > 0 {
+            let mut doc_block = DocPostingBlock::default();
+            while doc_block.len() < MAX_PL_BLOCK_SIZE {
+                if let Some((doc, tf)) = block_it.next() {
+                    doc_block.docids.push(*doc);
+                    doc_block.term_frequencies.push(*tf);
+                } else {
+                    break;
+                }
+            }
+
+            let key = field.pl_key(token, doc_block.first_docid().unwrap());
+            tx.insert(&field.docpl_keyspace, key, doc_block.encode(field.features));
+        }
+
+        Ok(())
     }
 }
 
