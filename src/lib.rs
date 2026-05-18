@@ -1,8 +1,7 @@
 use std::{collections::HashMap, hash::Hash, io};
 
 use fjall::{
-    Guard, KeyspaceCreateOptions, Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace,
-    SingleWriterWriteTx, Slice, Snapshot,
+    Database, Guard, KeyspaceCreateOptions, Keyspace, OwnedWriteBatch, Readable, Slice, Snapshot,
 };
 
 /// Type for document identifiers.
@@ -108,11 +107,6 @@ impl DocPostingBlock {
         self.docids.first().copied()
     }
 
-    /// Iterator over all the docids in this block.
-    pub fn doc_iter(&self) -> impl ExactSizeIterator<Item = DocId> + '_ {
-        self.docids.iter().copied()
-    }
-
     /// Returns the number of documents in the block.
     pub fn len(&self) -> usize {
         self.docids.len()
@@ -122,32 +116,6 @@ impl DocPostingBlock {
     #[allow(unused)]
     pub fn is_empty(&self) -> bool {
         self.docids.is_empty()
-    }
-
-    /// Insert docid in this block. If already present, update term_freq.
-    /// Returns the rank (index) of the entry, which callers can use to keep a
-    /// paired `PosPostingBlock` in sync.
-    pub fn insert(&mut self, docid: u64, term_freq: u32) -> usize {
-        match self.docids.binary_search(&docid) {
-            Ok(i) => {
-                self.term_frequencies[i] = term_freq;
-                i
-            }
-            Err(i) => {
-                self.docids.insert(i, docid);
-                self.term_frequencies.insert(i, term_freq);
-                i
-            }
-        }
-    }
-
-    /// Moves half of the entries in this block into a new block.
-    pub fn split(&mut self) -> DocPostingBlock {
-        let half = self.docids.len() / 2;
-        DocPostingBlock {
-            docids: self.docids.drain(half..).collect(),
-            term_frequencies: self.term_frequencies.drain(half..).collect(),
-        }
     }
 
     /// Decode a block from the key (contains first docid) and value.
@@ -252,14 +220,14 @@ impl TokenFieldFeatures {
 pub struct TokenFieldIndex {
     name: String,
     features: TokenFieldFeatures,
-    stats_keyspace: SingleWriterTxKeyspace,
-    docpl_keyspace: SingleWriterTxKeyspace,
-    pospl_keyspace: Option<SingleWriterTxKeyspace>,
+    stats_keyspace: Keyspace,
+    docpl_keyspace: Keyspace,
+    pospl_keyspace: Option<Keyspace>,
 }
 
 impl TokenFieldIndex {
     pub fn new(
-        db: &SingleWriterTxDatabase,
+        db: &Database,
         index: &str,
         name: &str,
         features: TokenFieldFeatures,
@@ -416,7 +384,9 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
         }
     }
 
-    /// Apply this batch as an append to `field` starting at `start_docid` to `tx`.
+    /// Apply this batch as an append to `field` starting at `start_docid`.
+    ///
+    /// Reads committed state from `snapshot`; writes are queued into `batch`.
     ///
     /// Returns the next free docid.
     ///
@@ -425,7 +395,8 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
         self,
         field: &TokenFieldIndex,
         start_docid: DocId,
-        tx: &mut SingleWriterWriteTx<'_>,
+        snapshot: &Snapshot,
+        batch: &mut OwnedWriteBatch,
     ) -> fjall::Result<DocId> {
         match self.rep {
             TokenIndexBufferRep::Doc(m) => {
@@ -435,9 +406,10 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
                         token.as_ref(),
                         start_docid,
                         pl.iter().map(|&d| (d, 1)),
-                        tx,
+                        snapshot,
+                        batch,
                     )?;
-                    Self::update_doc_pl(field, token.as_ref(), doc_block, tx)?;
+                    Self::update_doc_pl(field, token.as_ref(), doc_block, snapshot, batch)?;
                 }
             }
             TokenIndexBufferRep::WithTermFrequency(m) => {
@@ -447,9 +419,10 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
                         token.as_ref(),
                         start_docid,
                         pl.iter().copied(),
-                        tx,
+                        snapshot,
+                        batch,
                     )?;
-                    Self::update_doc_pl(field, token.as_ref(), doc_block, tx)?;
+                    Self::update_doc_pl(field, token.as_ref(), doc_block, snapshot, batch)?;
                 }
             }
             TokenIndexBufferRep::WithPositions(m) => {
@@ -459,12 +432,13 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
                         token.as_ref(),
                         start_docid,
                         pl.iter().map(|(doc, pospl)| (*doc, pospl.len() as u32)),
-                        tx,
+                        snapshot,
+                        batch,
                     )?;
-                    Self::update_doc_pl(field, token.as_ref(), doc_block, tx)?;
+                    Self::update_doc_pl(field, token.as_ref(), doc_block, snapshot, batch)?;
                     for (doc, positions) in pl {
                         let key = field.pospl_key(start_docid + doc as u64, token.as_ref());
-                        tx.insert(
+                        batch.insert(
                             field.pospl_keyspace.as_ref().unwrap(),
                             key,
                             encode_positions(&positions),
@@ -481,12 +455,13 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
         token: &[u8],
         start_docid: DocId,
         mut postings: impl ExactSizeIterator<Item = (u32, u32)>,
-        tx: &mut SingleWriterWriteTx<'_>,
+        snapshot: &Snapshot,
+        batch: &mut OwnedWriteBatch,
     ) -> fjall::Result<DocPostingBlock> {
         let mut block = DocPostingBlock::default();
 
         let stats_key = field.stats_key(token);
-        let old_stats = tx
+        let old_stats = snapshot
             .get(&field.stats_keyspace, &stats_key)?
             .and_then(TokenStats::decode);
         if let Some(TokenStats::SingleHit {
@@ -501,8 +476,7 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
         let (stats, block) = if postings.len() == 1 && old_stats.is_none() {
             let (ld, tf) = postings.next().unwrap();
             let docid = start_docid + ld as u64;
-            block.docids.push(docid);
-            block.term_frequencies.push(tf);
+            // SingleHit: leave block empty — no PL block is written for a single-doc term.
             (
                 TokenStats::SingleHit {
                     docid,
@@ -527,7 +501,11 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
             )
         };
 
-        tx.insert(&field.stats_keyspace, &stats_key, stats.encode().as_ref());
+        batch.insert(
+            &field.stats_keyspace,
+            stats_key,
+            stats.encode().as_ref(),
+        );
 
         Ok(block)
     }
@@ -536,12 +514,16 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
         field: &TokenFieldIndex,
         token: &[u8],
         block: DocPostingBlock,
-        tx: &mut SingleWriterWriteTx<'_>,
+        snapshot: &Snapshot,
+        batch: &mut OwnedWriteBatch,
     ) -> fjall::Result<()> {
+        if block.is_empty() {
+            return Ok(());
+        }
         let mut block_it = block.docids.iter().zip(block.term_frequencies.iter());
         let start_pl_key = field.pl_key(token, 0);
         let end_pl_key = field.pl_key(token, block.first_docid().unwrap());
-        if let Some(g) = tx
+        if let Some(g) = snapshot
             .range(
                 &field.docpl_keyspace,
                 start_pl_key.as_slice()..=end_pl_key.as_slice(),
@@ -559,7 +541,7 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
                     break;
                 }
             }
-            tx.insert(
+            batch.insert(
                 &field.docpl_keyspace,
                 key,
                 last_block.encode(field.features),
@@ -578,154 +560,15 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
             }
 
             let key = field.pl_key(token, doc_block.first_docid().unwrap());
-            tx.insert(&field.docpl_keyspace, key, doc_block.encode(field.features));
+            batch.insert(
+                &field.docpl_keyspace,
+                key,
+                doc_block.encode(field.features),
+            );
         }
 
         Ok(())
     }
-}
-
-/// Write a sequence of tokens into `field` at `docid`.
-///
-/// `tokens` is a stream of (position, term) so that callers may place more than one index term at
-/// a single position.
-///
-/// Results are written to `tx` so that multiple fields and/or documents can be processed at once.
-///
-/// Returns an error if reads from the underlying transaction fail.
-pub fn write_tokens<T: AsRef<[u8]> + Eq + Hash>(
-    docid: DocId,
-    field: &TokenFieldIndex,
-    tokens: impl Iterator<Item = (u32, T)>,
-    tx: &mut SingleWriterWriteTx<'_>,
-) -> fjall::Result<()> {
-    let mut index: HashMap<T, Vec<u32>> = HashMap::new();
-    for (pos, token) in tokens {
-        index.entry(token).or_default().push(pos);
-    }
-
-    for (token, positions) in index {
-        let stats_key = field.stats_key(&token);
-        let stats = tx
-            .get(&field.stats_keyspace, &stats_key)?
-            .and_then(TokenStats::decode);
-        let tf = if field.features.has_term_frequency() {
-            positions.len() as u64
-        } else {
-            1
-        };
-
-        let new_stats = match stats {
-            None => {
-                if let Some(pospl_keyspace) = field.pospl_keyspace.as_ref() {
-                    tx.insert(
-                        pospl_keyspace,
-                        field.pospl_key(docid, &token),
-                        encode_positions(&positions),
-                    );
-                }
-                TokenStats::SingleHit {
-                    docid,
-                    term_frequency: tf,
-                }
-            }
-            Some(TokenStats::SingleHit {
-                docid: hit_docid,
-                term_frequency,
-            }) => {
-                // The single hit rep does not have an actual posting list. Insert one before
-                // writing the posting entry.
-                let mut doc_block = DocPostingBlock::default();
-                doc_block.insert(hit_docid, term_frequency as u32);
-                tx.insert(
-                    &field.docpl_keyspace,
-                    field.pl_key(&token, hit_docid),
-                    doc_block.encode(field.features),
-                );
-                write_posting_entry(token.as_ref(), docid, positions, field, tx)?;
-                TokenStats::MultiHit {
-                    doc_frequency: 2,
-                    term_frequency: term_frequency + tf,
-                }
-            }
-            Some(TokenStats::MultiHit {
-                doc_frequency,
-                term_frequency,
-            }) => {
-                write_posting_entry(token.as_ref(), docid, positions, field, tx)?;
-                TokenStats::MultiHit {
-                    doc_frequency: doc_frequency + 1,
-                    term_frequency: term_frequency + tf,
-                }
-            }
-        };
-        tx.insert(
-            &field.stats_keyspace,
-            &stats_key,
-            new_stats.encode().as_ref(),
-        );
-    }
-
-    Ok(())
-}
-
-fn write_posting_entry(
-    token: &[u8],
-    docid: DocId,
-    positions: Vec<u32>,
-    field: &TokenFieldIndex,
-    tx: &mut SingleWriterWriteTx<'_>,
-) -> fjall::Result<()> {
-    let pl_start_key = field.pl_key(token, 0);
-    let pl_end_key = field.pl_key(token, docid);
-    let mut doc_pl_iter = tx.range(&field.docpl_keyspace, pl_start_key..=pl_end_key);
-    let (mut pl_key, doc_pl_value) = doc_pl_iter
-        .next_back()
-        .or_else(|| doc_pl_iter.next())
-        .expect("multi-hit pl must have at least one block")
-        .into_inner()?;
-
-    let mut doc_pl_block =
-        DocPostingBlock::decode(&pl_key, doc_pl_value, field.features).expect("doc pl decode");
-
-    doc_pl_block.insert(docid, positions.len() as u32);
-
-    if doc_pl_block.len() > MAX_PL_BLOCK_SIZE {
-        let doc_block_tail = doc_pl_block.split();
-        let docid_tail = doc_block_tail.doc_iter().next().unwrap();
-        let key = field.pl_key(token, docid_tail);
-        tx.insert(
-            &field.docpl_keyspace,
-            &key,
-            doc_block_tail.encode(field.features),
-        );
-    }
-
-    let old_pl_key_docid = doc_pl_block
-        .doc_iter()
-        .next()
-        .expect("non-empty doc pl block");
-    let new_pl_key_docid = doc_pl_block.doc_iter().next().unwrap();
-    if old_pl_key_docid != new_pl_key_docid {
-        tx.remove(&field.docpl_keyspace, pl_key.clone());
-        pl_key = Slice::from(field.pl_key(token, new_pl_key_docid));
-    }
-
-    tx.insert(
-        &field.docpl_keyspace,
-        pl_key,
-        doc_pl_block.encode(field.features),
-    );
-
-    if let Some(pospl_keyspace) = field.pospl_keyspace.as_ref() {
-        tx.insert(
-            pospl_keyspace,
-            field.pospl_key(docid, token),
-            encode_positions(&positions),
-        );
-    }
-
-    Ok(())
 }
 
 /// Value yielded by methods returning a DocId if there are no more results.
@@ -787,12 +630,11 @@ struct DocBlockState {
 }
 
 struct PosState {
-    keyspace: SingleWriterTxKeyspace,
+    keyspace: Keyspace,
     /// Full pospl key with a placeholder docid in the first 8 bytes, updated before each lookup.
     key: Vec<u8>,
 }
 
-// TODO: generics -- Readable instead of Snapshot; AsRef<Keyspace> instead of SingleWriterTxKeyspace.
 pub struct TokenPostingIterator {
     features: TokenFieldFeatures,
     size_hint: u64,
@@ -801,7 +643,7 @@ pub struct TokenPostingIterator {
     scratch_key: Vec<u8>,
     end_key: Vec<u8>,
 
-    keyspace: SingleWriterTxKeyspace,
+    keyspace: Keyspace,
     /// `Some((docid, term_frequency))` when the stats entry is `SingleHit` and
     /// there is no doc posting list in the keyspace.
     single_doc: Option<(DocId, u64)>,
@@ -1063,21 +905,17 @@ impl PostingIterator for TokenPostingIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fjall::SingleWriterTxDatabase;
-
     // Fields are dropped in declaration order: db before tmpdir, ensuring the fjall
     // database is closed before the temporary directory is removed.
     struct Fixture {
-        db: SingleWriterTxDatabase,
+        db: Database,
         _tmpdir: tempfile::TempDir,
     }
 
     impl Fixture {
         fn new() -> Self {
             let tmpdir = tempfile::tempdir().unwrap();
-            let db = SingleWriterTxDatabase::builder(tmpdir.path())
-                .open()
-                .unwrap();
+            let db = Database::builder(tmpdir.path()).open().unwrap();
             Self {
                 db,
                 _tmpdir: tmpdir,
@@ -1089,13 +927,16 @@ mod tests {
         }
 
         fn write(&self, field: &TokenFieldIndex, docid: u64, tokens: &[(u32, &[u8])]) {
-            let mut tx = self.db.write_tx();
-            write_tokens(docid, field, tokens.iter().map(|&(p, t)| (p, t)), &mut tx).unwrap();
-            tx.commit().unwrap();
+            let mut buf = TokenIndexBuffer::new(field.features);
+            buf.add_doc(tokens.iter().map(|&(p, t)| (p, t)));
+            let snap = self.db.snapshot();
+            let mut batch = self.db.batch();
+            buf.apply_append(field, docid, &snap, &mut batch).unwrap();
+            batch.commit().unwrap();
         }
 
         fn iter(&self, field: &TokenFieldIndex, token: &[u8]) -> Option<TokenPostingIterator> {
-            let snap = self.db.read_tx();
+            let snap = self.db.snapshot();
             TokenPostingIterator::new(snap, field, token).unwrap()
         }
     }

@@ -6,7 +6,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use fjall::{KeyspaceCreateOptions, SingleWriterTxDatabase};
+use fjall::{Database, KeyspaceCreateOptions};
 use indicatif::{ProgressBar, ProgressStyle};
 use mt_postings::{TokenFieldFeatures, TokenFieldIndex, TokenIndexBuffer};
 use reader::BinDocReader;
@@ -39,6 +39,9 @@ enum Command {
         /// Maximum memtable size in megabytes per keyspace before a flush is triggered.
         #[arg(long, default_value_t = 8)]
         memtable_size_mb: u64,
+        /// Block cache size in megabytes.
+        #[arg(long, default_value_t = 64)]
+        cache_size_mb: u64,
     },
     /// Drop all keyspaces for the ingested fields.
     Drop,
@@ -80,9 +83,11 @@ fn ingest(
     batch_size: usize,
     journaling_size_mb: u64,
     memtable_size_mb: u64,
+    cache_size_mb: u64,
 ) {
-    let database = SingleWriterTxDatabase::builder(db)
+    let database = Database::builder(db)
         .max_journaling_size(journaling_size_mb * 1_024 * 1_024)
+        .cache_size(cache_size_mb * 1_024 * 1_024)
         .open()
         .expect("failed to open fjall database");
 
@@ -148,17 +153,18 @@ fn ingest(
                  random_label_buf: TokenIndexBuffer<String>,
                  start_docid: u64|
      -> u64 {
-        let mut tx = database.write_tx();
+        let snap = database.snapshot();
+        let mut batch = database.batch();
         let next = title_buf
-            .apply_append(&title_field, start_docid, &mut tx)
+            .apply_append(&title_field, start_docid, &snap, &mut batch)
             .expect("failed to apply title buffer");
         body_buf
-            .apply_append(&body_field, start_docid, &mut tx)
+            .apply_append(&body_field, start_docid, &snap, &mut batch)
             .expect("failed to apply body buffer");
         random_label_buf
-            .apply_append(&random_label_field, start_docid, &mut tx)
+            .apply_append(&random_label_field, start_docid, &snap, &mut batch)
             .expect("failed to apply random_label buffer");
-        tx.commit().expect("failed to commit transaction");
+        batch.commit().expect("failed to commit batch");
         next
     };
 
@@ -196,7 +202,7 @@ fn ingest(
 }
 
 fn stat(db: &PathBuf) {
-    let database = SingleWriterTxDatabase::builder(db)
+    let database = Database::builder(db)
         .open()
         .expect("failed to open fjall database");
 
@@ -208,7 +214,7 @@ fn stat(db: &PathBuf) {
                 let ks = database
                     .keyspace(&name, KeyspaceCreateOptions::default)
                     .expect("failed to open keyspace");
-                println!("  {section}: {}", format_bytes(ks.inner().disk_space()));
+                println!("  {section}: {}", format_bytes(ks.disk_space()));
             } else {
                 println!("  {section}: (not found)");
             }
@@ -217,7 +223,7 @@ fn stat(db: &PathBuf) {
 }
 
 fn compact(db: &PathBuf) {
-    let database = SingleWriterTxDatabase::builder(db)
+    let database = Database::builder(db)
         .open()
         .expect("failed to open fjall database");
 
@@ -238,10 +244,9 @@ fn compact(db: &PathBuf) {
                 let ks = database
                     .keyspace(&name, KeyspaceCreateOptions::default)
                     .expect("failed to open keyspace");
-                ks.inner()
-                    .rotate_memtable_and_wait()
+                ks.rotate_memtable_and_wait()
                     .expect("failed to flush memtable");
-                ks.inner().major_compact().expect("failed to compact");
+                ks.major_compact().expect("failed to compact");
             }
         }
     }
@@ -250,7 +255,7 @@ fn compact(db: &PathBuf) {
 }
 
 fn drop(db: &PathBuf) {
-    let database = SingleWriterTxDatabase::builder(db)
+    let database = Database::builder(db)
         .open()
         .expect("failed to open fjall database");
 
@@ -262,8 +267,7 @@ fn drop(db: &PathBuf) {
                     .keyspace(&name, KeyspaceCreateOptions::default)
                     .expect("failed to open keyspace");
                 database
-                    .inner()
-                    .delete_keyspace(ks.inner().clone())
+                    .delete_keyspace(ks)
                     .expect("failed to delete keyspace");
                 println!("dropped {name}");
             } else {
@@ -283,6 +287,7 @@ fn main() {
             batch_size,
             journaling_size_mb,
             memtable_size_mb,
+            cache_size_mb,
         } => ingest(
             &cli.db,
             &bin_file,
@@ -290,6 +295,7 @@ fn main() {
             batch_size,
             journaling_size_mb,
             memtable_size_mb,
+            cache_size_mb,
         ),
         Command::Stat => stat(&cli.db),
         Command::Compact => compact(&cli.db),
