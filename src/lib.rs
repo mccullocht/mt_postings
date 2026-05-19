@@ -220,9 +220,7 @@ impl TokenFieldFeatures {
 pub struct TokenFieldIndex {
     name: String,
     features: TokenFieldFeatures,
-    stats_keyspace: Keyspace,
-    docpl_keyspace: Keyspace,
-    pospl_keyspace: Option<Keyspace>,
+    keyspace: Keyspace,
 }
 
 impl TokenFieldIndex {
@@ -233,63 +231,58 @@ impl TokenFieldIndex {
         features: TokenFieldFeatures,
         keyspace_create_options: Option<KeyspaceCreateOptions>,
     ) -> fjall::Result<Self> {
-        let stats_keyspace = db.keyspace(&format!("{index}.{name}.stats"), || {
+        let keyspace = db.keyspace(index, || {
             keyspace_create_options.clone().unwrap_or_default()
         })?;
-        let docpl_keyspace = db.keyspace(&format!("{index}.{name}.docpl"), || {
-            keyspace_create_options.clone().unwrap_or_default()
-        })?;
-        let pospl_keyspace = if features == TokenFieldFeatures::WithPositions {
-            Some(db.keyspace(&format!("{index}.{name}.pospl"), || {
-                keyspace_create_options.clone().unwrap_or_default()
-            })?)
-        } else {
-            None
-        };
         Ok(Self {
             name: name.to_string(),
             features,
-            stats_keyspace,
-            docpl_keyspace,
-            pospl_keyspace,
+            keyspace,
         })
     }
 
+    // Key format: {name}:stats:{token}
     fn stats_key(&self, token: impl AsRef<[u8]>) -> Vec<u8> {
         let token_ref = token.as_ref();
-        let mut key = Vec::with_capacity(self.name.len() + 1 + token_ref.len());
+        let mut key = Vec::with_capacity(self.name.len() + 7 + token_ref.len());
         key.extend_from_slice(self.name.as_bytes());
-        key.push(b':');
+        key.extend_from_slice(b":stats:");
         key.extend_from_slice(token_ref);
         key
     }
 
+    // Key format: {name}:docpl:{token}:{docid_be8}
     fn pl_key(&self, token: impl AsRef<[u8]>, first_docid: DocId) -> Vec<u8> {
         let token_ref = token.as_ref();
-        let mut key = Vec::with_capacity(self.name.len() + 1 + token_ref.len() + 9);
+        let mut key = Vec::with_capacity(self.name.len() + 7 + token_ref.len() + 9);
         key.extend_from_slice(self.name.as_bytes());
-        key.push(b':');
+        key.extend_from_slice(b":docpl:");
         key.extend_from_slice(token_ref);
         key.push(b':');
         key.extend_from_slice(&first_docid.to_be_bytes());
         key
     }
 
+    // Key format: {name}:pospl:{docid_be8}:{token}
     fn pospl_key(&self, docid: DocId, token: impl AsRef<[u8]>) -> Vec<u8> {
         let token_ref = token.as_ref();
-        let mut key = Vec::with_capacity(8 + 1 + self.name.len() + 1 + token_ref.len());
-        key.extend_from_slice(&docid.to_be_bytes());
-        key.push(b':');
+        let mut key = Vec::with_capacity(self.name.len() + 7 + 8 + 1 + token_ref.len());
         key.extend_from_slice(self.name.as_bytes());
+        key.extend_from_slice(b":pospl:");
+        key.extend_from_slice(&docid.to_be_bytes());
         key.push(b':');
         key.extend_from_slice(token_ref);
         key
     }
 
+    fn pospl_docid_offset(&self) -> usize {
+        self.name.len() + 7 // length of "{name}:pospl:"
+    }
+
     fn pl_key_extract_docid(key: impl AsRef<[u8]>) -> Option<DocId> {
         let key_ref = key.as_ref();
-        // Field name and token text must be at least, plus separators and the docid: 2+2+8=12
-        if key_ref.len() < 12 {
+        // {name}:docpl:{token}:{docid_be8}: min length is 1+7+1+1+8 = 18
+        if key_ref.len() < 18 {
             return None;
         }
 
@@ -439,7 +432,7 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
                     for (doc, positions) in pl {
                         let key = field.pospl_key(start_docid + doc as u64, token.as_ref());
                         batch.insert(
-                            field.pospl_keyspace.as_ref().unwrap(),
+                            &field.keyspace,
                             key,
                             encode_positions(&positions),
                         );
@@ -462,7 +455,7 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
 
         let stats_key = field.stats_key(token);
         let old_stats = snapshot
-            .get(&field.stats_keyspace, &stats_key)?
+            .get(&field.keyspace, &stats_key)?
             .and_then(TokenStats::decode);
         if let Some(TokenStats::SingleHit {
             docid,
@@ -502,7 +495,7 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
         };
 
         batch.insert(
-            &field.stats_keyspace,
+            &field.keyspace,
             stats_key,
             stats.encode().as_ref(),
         );
@@ -525,7 +518,7 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
         let end_pl_key = field.pl_key(token, block.first_docid().unwrap());
         if let Some(g) = snapshot
             .range(
-                &field.docpl_keyspace,
+                &field.keyspace,
                 start_pl_key.as_slice()..=end_pl_key.as_slice(),
             )
             .next_back()
@@ -542,7 +535,7 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
                 }
             }
             batch.insert(
-                &field.docpl_keyspace,
+                &field.keyspace,
                 key,
                 last_block.encode(field.features),
             );
@@ -561,7 +554,7 @@ impl<T: AsRef<[u8]> + Eq + Hash> TokenIndexBuffer<T> {
 
             let key = field.pl_key(token, doc_block.first_docid().unwrap());
             batch.insert(
-                &field.docpl_keyspace,
+                &field.keyspace,
                 key,
                 doc_block.encode(field.features),
             );
@@ -630,9 +623,9 @@ struct DocBlockState {
 }
 
 struct PosState {
-    keyspace: Keyspace,
-    /// Full pospl key with a placeholder docid in the first 8 bytes, updated before each lookup.
+    /// Full pospl key with a placeholder docid, updated before each lookup.
     key: Vec<u8>,
+    docid_offset: usize,
 }
 
 pub struct TokenPostingIterator {
@@ -658,7 +651,7 @@ impl TokenPostingIterator {
         field: &TokenFieldIndex,
         token: impl AsRef<[u8]>,
     ) -> fjall::Result<Option<Self>> {
-        let stats_value = snapshot.get(&field.stats_keyspace, field.stats_key(&token))?;
+        let stats_value = snapshot.get(&field.keyspace, field.stats_key(&token))?;
         if stats_value.is_none() {
             return Ok(None);
         }
@@ -675,9 +668,9 @@ impl TokenPostingIterator {
                     term_frequency: _,
                 } => (doc_frequency, None),
             };
-        let pos_state = field.pospl_keyspace.as_ref().map(|ks| PosState {
-            keyspace: ks.clone(),
+        let pos_state = field.features.has_positions().then(|| PosState {
             key: field.pospl_key(0, &token),
+            docid_offset: field.pospl_docid_offset(),
         });
         Ok(Some(TokenPostingIterator {
             features: field.features,
@@ -685,7 +678,7 @@ impl TokenPostingIterator {
             snapshot,
             scratch_key: end_key.clone(),
             end_key,
-            keyspace: field.docpl_keyspace.clone(),
+            keyspace: field.keyspace.clone(),
             single_doc,
             doc_state: None,
             pos_state,
@@ -892,10 +885,11 @@ impl PostingIterator for TokenPostingIterator {
 
         assert!(self.doc_state.is_some());
         let pos_state = self.pos_state.as_mut().unwrap();
-        pos_state.key[..8].copy_from_slice(&self.doc.to_be_bytes());
+        let off = pos_state.docid_offset;
+        pos_state.key[off..off + 8].copy_from_slice(&self.doc.to_be_bytes());
         let value = self
             .snapshot
-            .get(&pos_state.keyspace, &pos_state.key)
+            .get(&self.keyspace, &pos_state.key)
             .expect("no io error")
             .expect("pos entry exists");
         decode_positions(value, out);

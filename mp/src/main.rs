@@ -206,19 +206,14 @@ fn stat(db: &PathBuf) {
         .open()
         .expect("failed to open fjall database");
 
-    for field in ["title", "body", "random_label"] {
-        println!("{field}:");
-        for section in ["stats", "docpl", "pospl"] {
-            let name = format!("enwiki.{field}.{section}");
-            if database.keyspace_exists(&name) {
-                let ks = database
-                    .keyspace(&name, KeyspaceCreateOptions::default)
-                    .expect("failed to open keyspace");
-                println!("  {section}: {}", format_bytes(ks.disk_space()));
-            } else {
-                println!("  {section}: (not found)");
-            }
-        }
+    let name = "enwiki";
+    if database.keyspace_exists(name) {
+        let ks = database
+            .keyspace(name, KeyspaceCreateOptions::default)
+            .expect("failed to open keyspace");
+        println!("{name}: {}", format_bytes(ks.disk_space()));
+    } else {
+        println!("{name}: (not found)");
     }
 }
 
@@ -236,19 +231,15 @@ fn compact(db: &PathBuf) {
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    for field in ["title", "body", "random_label"] {
-        for section in ["stats", "docpl", "pospl"] {
-            let name = format!("enwiki.{field}.{section}");
-            if database.keyspace_exists(&name) {
-                pb.set_message(format!("compacting {name}"));
-                let ks = database
-                    .keyspace(&name, KeyspaceCreateOptions::default)
-                    .expect("failed to open keyspace");
-                ks.rotate_memtable_and_wait()
-                    .expect("failed to flush memtable");
-                ks.major_compact().expect("failed to compact");
-            }
-        }
+    let name = "enwiki";
+    if database.keyspace_exists(name) {
+        pb.set_message(format!("compacting {name}"));
+        let ks = database
+            .keyspace(name, KeyspaceCreateOptions::default)
+            .expect("failed to open keyspace");
+        ks.rotate_memtable_and_wait()
+            .expect("failed to flush memtable");
+        ks.major_compact().expect("failed to compact");
     }
 
     pb.finish_with_message(format!("done in {:.1}s", start.elapsed().as_secs_f64()));
@@ -259,21 +250,17 @@ fn drop(db: &PathBuf) {
         .open()
         .expect("failed to open fjall database");
 
-    for field in ["title", "body", "random_label"] {
-        for section in ["stats", "docpl", "pospl"] {
-            let name = format!("enwiki.{field}.{section}");
-            if database.keyspace_exists(&name) {
-                let ks = database
-                    .keyspace(&name, KeyspaceCreateOptions::default)
-                    .expect("failed to open keyspace");
-                database
-                    .delete_keyspace(ks)
-                    .expect("failed to delete keyspace");
-                println!("dropped {name}");
-            } else {
-                println!("skipped {name} (does not exist)");
-            }
-        }
+    let name = "enwiki";
+    if database.keyspace_exists(name) {
+        let ks = database
+            .keyspace(name, KeyspaceCreateOptions::default)
+            .expect("failed to open keyspace");
+        database
+            .delete_keyspace(ks)
+            .expect("failed to delete keyspace");
+        println!("dropped {name}");
+    } else {
+        println!("skipped {name} (does not exist)");
     }
 }
 
